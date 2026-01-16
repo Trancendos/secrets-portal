@@ -1,32 +1,49 @@
-## Description
-Brief description of changes.
+## 📋 Description
+Briefly describe what this PR does.
 
-## Type of Change
-- [ ] Bug fix
-- [ ] New feature
-- [ ] Breaking change
-- [ ] Documentation update
+## 💪 Type of Change
+- [ ] 🎆 New feature
+- [ ] 🐛 Bug fix
+- [ ] 📄 Documentation
+- [ ] 🙋 Style/formatting
+- [ ] 🖀 Refactor
+- [ ] 🧪 Test
+- [ ] ⚠️ Breaking change
 
-## Related Issue
+## 📋 Related Issues
 Closes #(issue number)
 
-## Testing
-- [ ] Manual testing done
-- [ ] Unit tests added
-- [ ] Integration tests added
+Or if no issue:
+(Description of what problem this solves)
 
-## Checklist
+## 🧪 Testing
+Describe how you tested this:
+- [ ] Unit tests added/updated
+- [ ] Integration tests added/updated
+- [ ] Manual testing completed
+- [ ] Tested on mobile (if applicable)
+- [ ] All tests pass locally
+
+## 📚 Documentation
+- [ ] README.md updated
+- [ ] API docs updated
+- [ ] Comments added for complex logic
+- [ ] User-facing changes documented
+
+## ✅ Checklist
 - [ ] Code follows style guide
-- [ ] No console errors
-- [ ] Documentation updated
-- [ ] Tested in Chrome/Firefox
-- [ ] Mobile responsive
+- [ ] No console errors/warnings
+- [ ] Tests pass (npm test)
+- [ ] Type checks pass (npm run type-check)
+- [ ] Linting passes (npm run lint)
+- [ ] No new dependencies added (or justified)
+- [ ] Bundle size impact is acceptable
+- [ ] Accessibility checked (WCAG 2.1 AA)
+- [ ] Mobile responsive tested
 - [ ] No breaking changes
 
-## Screenshots (if applicable)
+## 📸 Screenshots (if applicable)
+Add screenshots for UI changes
 
-## Performance Impact
-Any performance changes?
-
-## Security Considerations
-Any security implications?
+## 📦 Additional Context
+Any additional context or dependencies:
