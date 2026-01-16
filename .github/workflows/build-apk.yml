@@ -1,0 +1,53 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'mobile/**'
+      - '.github/workflows/build-apk.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v2
+
+      - name: Install dependencies
+        run: |
+          cd mobile
+          npm install
+
+      - name: Build APK
+        run: |
+          cd mobile
+          npx react-native build-android --dev
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v3
+        with:
+          name: secrets-portal-app
+          path: mobile/android/app/build/outputs/apk/
+
+      - name: Create Release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: mobile/android/app/build/outputs/apk/**/*.apk
+          tag_name: v1.0.0
+          release_name: Secrets Portal Mobile v1.0.0
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

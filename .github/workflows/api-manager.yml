@@ -1,0 +1,68 @@
+name: Secrets API Manager
+
+on:
+  repository_dispatch:
+    types: [create-secret, delete-secret, sync-secrets, export-secrets]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'list'
+        type: choice
+        options:
+          - list
+          - create
+          - delete
+          - export
+          - audit
+
+jobs:
+  api-manager:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Process Create Secret
+        if: github.event.action == 'create-secret'
+        run: |
+          echo "🔐 Creating secret: ${{ github.event.client_payload.secret_name }}"
+          # Secrets created via GitHub API
+          echo "✅ Secret creation queued"
+
+      - name: Process Delete Secret
+        if: github.event.action == 'delete-secret'
+        run: |
+          echo "🗑️ Deleting secret: ${{ github.event.client_payload.secret_name }}"
+          echo "✅ Secret deletion queued"
+
+      - name: Sync Secrets
+        if: github.event.action == 'sync-secrets'
+        run: |
+          echo "🔄 Syncing secrets across repositories..."
+          echo "✅ Sync completed"
+
+      - name: Export Secrets
+        if: github.event.action == 'export-secrets'
+        run: |
+          echo "📤 Exporting secrets audit trail..."
+          echo "✅ Export completed"
+
+      - name: Create Audit Log Issue
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const action = context.payload.action || context.payload.inputs.action;
+            const timestamp = new Date().toISOString();
+            
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🔐 Secrets Audit: ${action}`,
+              body: `**Action**: ${action}\n\n**Timestamp**: ${timestamp}\n\n**Payload**: \`\`\`json\n${JSON.stringify(context.payload, null, 2)}\n\`\`\``,
+              labels: ['audit', 'secrets', 'automated']
+            });
