@@ -1,0 +1,16 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: daily
+      time: "03:00"
+    reviewers:
+      - Trancendos
+    labels:
+      - dependencies
+      - npm
+    auto-merge: true
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"

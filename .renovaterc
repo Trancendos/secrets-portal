@@ -1,0 +1,13 @@
+{
+  "extends": ["config:base", "schedules:monthly"],
+  "reviewers": ["Trancendos"],
+  "labels": ["dependencies"],
+  "automerge": true,
+  "major": {
+    "automerge": false
+  },
+  "vulnerabilityAlerts": {
+    "labels": ["security"],
+    "automerge": true
+  }
+}
