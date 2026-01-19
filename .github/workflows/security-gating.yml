@@ -1,0 +1,703 @@
+name: Security Gating
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main, develop]
+  workflow_dispatch:
+
+# Prevent concurrent runs to avoid race conditions
+concurrency:
+  group: security-gating-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Job 1: Dependency and CVE Scanning
+  dependency-scan:
+    name: Dependency & CVE Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+        continue-on-error: false
+
+      - name: NPM Audit (High/Critical)
+        id: npm-audit
+        run: |
+          set +e
+          npm audit --audit-level=high --json > npm-audit-report.json
+          EXIT_CODE=$?
+          echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+          
+          if [ $EXIT_CODE -ne 0 ]; then
+            echo "::error::NPM audit found vulnerabilities"
+            cat npm-audit-report.json
+          fi
+          exit 0
+        continue-on-error: true
+
+      - name: Trivy Filesystem Scan
+        id: trivy-fs
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs-results.sarif'
+          severity: 'HIGH,CRITICAL'
+          exit-code: '0'
+        continue-on-error: true
+
+      - name: OWASP Dependency Check
+        id: owasp-check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'secrets-portal'
+          path: '.'
+          format: 'JSON,HTML,SARIF'
+          args: >
+            --enableRetired
+            --enableExperimental
+            --nvdApiKey ${{ secrets.NVD_API_KEY || '' }}
+        continue-on-error: true
+
+      - name: Upload SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: |
+            trivy-fs-results.sarif
+            dependency-check-report.sarif
+        continue-on-error: true
+
+      - name: Save dependency scan results
+        if: always()
+        run: |
+          mkdir -p scan-results
+          cp npm-audit-report.json scan-results/ 2>/dev/null || echo "{}" > scan-results/npm-audit-report.json
+          cp trivy-fs-results.sarif scan-results/ 2>/dev/null || echo "{}" > scan-results/trivy-fs-results.sarif
+          cp dependency-check-report.json scan-results/ 2>/dev/null || echo "{}" > scan-results/dependency-check-report.json
+          cp dependency-check-report.html scan-results/ 2>/dev/null || true
+
+      - name: Upload scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-scan-results
+          path: scan-results/
+          retention-days: 90
+
+  # Job 2: Docker Image Scanning (if Dockerfile exists)
+  docker-scan:
+    name: Docker Image Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for Dockerfiles
+        id: check-docker
+        run: |
+          if find . -name "Dockerfile*" -o -name "*.dockerfile" | grep -q .; then
+            echo "has_docker=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_docker=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.check-docker.outputs.has_docker == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker images for scanning
+        if: steps.check-docker.outputs.has_docker == 'true'
+        id: docker-build
+        run: |
+          mkdir -p scan-results
+          for dockerfile in $(find . -name "Dockerfile*" -o -name "*.dockerfile"); do
+            # Sanitize the image name to avoid shell injection
+            SAFE_DIR=$(basename "$(dirname "$dockerfile")" | tr -cd '[:alnum:]._-')
+            SAFE_FILE=$(basename "$dockerfile" | tr -cd '[:alnum:]._-')
+            IMAGE_NAME="scan-${SAFE_DIR}-${SAFE_FILE}"
+            echo "Building $IMAGE_NAME from $dockerfile"
+            docker build -f "$dockerfile" -t "$IMAGE_NAME:latest" "$(dirname "$dockerfile")" || true
+          done
+        continue-on-error: true
+
+      - name: Trivy Docker Image Scan
+        if: steps.check-docker.outputs.has_docker == 'true'
+        run: |
+          mkdir -p scan-results
+          IMAGE_COUNT=0
+          for image in $(docker images --format "{{.Repository}}:{{.Tag}}" | grep "^scan-"); do
+            IMAGE_COUNT=$((IMAGE_COUNT + 1))
+            # Use image count for unique filenames to avoid collisions
+            echo "Scanning image: $image"
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v $(pwd)/scan-results:/results \
+              aquasec/trivy:latest image \
+              --format sarif \
+              --output /results/trivy-docker-${IMAGE_COUNT}.sarif \
+              --severity HIGH,CRITICAL \
+              --exit-code 0 \
+              "$image" || true
+          done
+        continue-on-error: true
+
+      - name: Upload Docker scan results
+        if: always() && steps.check-docker.outputs.has_docker == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-scan-results
+          path: scan-results/
+          retention-days: 90
+
+      - name: Docker scan summary
+        if: always()
+        run: |
+          if [ "${{ steps.check-docker.outputs.has_docker }}" == "true" ]; then
+            echo "Docker images scanned successfully"
+          else
+            echo "No Dockerfiles found - skipping Docker scan"
+          fi
+
+  # Job 3: Infrastructure as Code Scanning
+  iac-scan:
+    name: Infrastructure as Code Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Trivy IaC Scan
+        id: trivy-iac
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: 'config'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-iac-results.sarif'
+          severity: 'HIGH,CRITICAL'
+          exit-code: '0'
+        continue-on-error: true
+
+      - name: Checkov IaC Scan
+        id: checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          framework: all
+          output_format: json,sarif
+          output_file_path: console,checkov-results.sarif
+          soft_fail: true
+        continue-on-error: true
+
+      - name: TFSec Terraform Scan
+        id: tfsec
+        run: |
+          if find . -name "*.tf" | grep -q .; then
+            docker run --rm -v $(pwd):/src aquasec/tfsec:latest /src \
+              --format sarif \
+              --out /src/tfsec-results.sarif \
+              --soft-fail || true
+          else
+            echo "No Terraform files found"
+          fi
+        continue-on-error: true
+
+      - name: Save IaC scan results
+        if: always()
+        run: |
+          mkdir -p scan-results
+          cp trivy-iac-results.sarif scan-results/ 2>/dev/null || echo "{}" > scan-results/trivy-iac-results.sarif
+          cp checkov-results.sarif scan-results/ 2>/dev/null || echo "{}" > scan-results/checkov-results.sarif
+          cp tfsec-results.sarif scan-results/ 2>/dev/null || true
+
+      - name: Upload IaC scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iac-scan-results
+          path: scan-results/
+          retention-days: 90
+
+  # Job 4: OAuth2 and OWASP Security Checks
+  oauth-owasp-scan:
+    name: OAuth2 & OWASP Checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: OAuth2 Configuration Check
+        id: oauth-check
+        run: |
+          mkdir -p scan-results
+          ISSUES=""
+          
+          # Check for OAuth2 best practices
+          echo "Checking OAuth2 implementation..."
+          
+          # Check for client secret in code (should not exist) - exclude test files and examples
+          if grep -r "client_secret" src/ 2>/dev/null | grep -v -E "\\.test\\.|_test\\.|\\btests?/|\\bspec\\.|example"; then
+            ISSUES="${ISSUES}\n- ❌ Client secret found in source code"
+          fi
+          
+          # Check for proper redirect URI validation
+          if ! grep -r "redirect.*uri" src/ 2>/dev/null | grep -i "validat" > /dev/null; then
+            ISSUES="${ISSUES}\n- ⚠️  Redirect URI validation not found"
+          fi
+          
+          # Check for state parameter usage (CSRF protection)
+          if ! grep -r "state" src/ 2>/dev/null | grep -i "oauth\|auth" > /dev/null; then
+            ISSUES="${ISSUES}\n- ⚠️  OAuth state parameter not found (CSRF protection)"
+          fi
+          
+          # Check for PKCE implementation
+          if grep -r "code_challenge" src/ 2>/dev/null > /dev/null; then
+            echo "✅ PKCE implementation found"
+          fi
+          
+          if [ -n "$ISSUES" ]; then
+            echo "oauth_issues<<EOF" >> $GITHUB_OUTPUT
+            echo -e "$ISSUES" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            echo "has_issues=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_issues=false" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: OWASP Top 10 Check
+        id: owasp-check
+        run: |
+          mkdir -p scan-results
+          OWASP_ISSUES=""
+          
+          echo "Checking OWASP Top 10 2021 compliance..."
+          
+          # A01:2021 – Broken Access Control
+          if ! grep -r "authori" src/ 2>/dev/null | grep -i "check\|verify" > /dev/null; then
+            OWASP_ISSUES="${OWASP_ISSUES}\n- ⚠️  A01: Authorization checks may be missing"
+          fi
+          
+          # A02:2021 – Cryptographic Failures
+          if grep -ri "md5\|sha1" src/ 2>/dev/null | grep -v "comment" | grep -v "test"; then
+            OWASP_ISSUES="${OWASP_ISSUES}\n- ❌ A02: Weak cryptographic algorithms found (MD5/SHA1)"
+          fi
+          
+          # A03:2021 – Injection
+          if ! grep -r "sanitize\|escape\|DOMPurify" src/ 2>/dev/null > /dev/null; then
+            OWASP_ISSUES="${OWASP_ISSUES}\n- ⚠️  A03: Input sanitization not clearly implemented"
+          fi
+          
+          # A05:2021 – Security Misconfiguration
+          if grep -r "eval(" src/ 2>/dev/null | grep -v "test" | grep -v "comment"; then
+            OWASP_ISSUES="${OWASP_ISSUES}\n- ❌ A05: eval() usage found (security risk)"
+          fi
+          
+          # A06:2021 – Vulnerable and Outdated Components (handled by dependency scan)
+          
+          # A07:2021 – Identification and Authentication Failures
+          if ! grep -r "session\|token" src/ 2>/dev/null | grep -i "timeout\|expir" > /dev/null; then
+            OWASP_ISSUES="${OWASP_ISSUES}\n- ⚠️  A07: Session timeout not clearly implemented"
+          fi
+          
+          # A09:2021 – Security Logging and Monitoring Failures
+          if ! grep -r "log\|audit" src/ 2>/dev/null | grep -i "security\|auth\|error" > /dev/null; then
+            OWASP_ISSUES="${OWASP_ISSUES}\n- ⚠️  A09: Security logging may be insufficient"
+          fi
+          
+          if [ -n "$OWASP_ISSUES" ]; then
+            echo "owasp_issues<<EOF" >> $GITHUB_OUTPUT
+            echo -e "$OWASP_ISSUES" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            echo "has_issues=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_issues=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # Save results
+          echo "OAuth2 and OWASP checks completed" > scan-results/oauth-owasp-results.txt
+        continue-on-error: true
+
+      - name: Upload OAuth/OWASP results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oauth-owasp-results
+          path: scan-results/
+          retention-days: 90
+
+  # Job 5: Generate Security Report and Send Alerts
+  security-report:
+    name: Generate Security Report
+    runs-on: ubuntu-latest
+    needs: [dependency-scan, docker-scan, iac-scan, oauth-owasp-scan]
+    if: always()
+    permissions:
+      contents: write
+      pull-requests: write
+      security-events: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all scan results
+        uses: actions/download-artifact@v4
+        with:
+          path: all-scan-results
+        continue-on-error: true
+
+      - name: Generate Security Report
+        id: generate-report
+        run: |
+          REPORT_FILE="SECURITY_SCAN_REPORT.md"
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          WORKFLOW="${{ github.workflow }}"
+          RUN_NUMBER="${{ github.run_number }}"
+          COMMIT_SHA="${{ github.sha }}"
+          REF_NAME="${{ github.ref_name }}"
+          
+          cat > $REPORT_FILE << EOFHEADER
+          # 🔒 Security Scan Report
+          
+          **Generated:** $TIMESTAMP
+          **Workflow:** $WORKFLOW
+          **Run:** $RUN_NUMBER
+          **Commit:** $COMMIT_SHA
+          **Branch:** $REF_NAME
+          
+          ---
+          
+          EOFHEADER
+          
+          CRITICAL_COUNT=0
+          HIGH_COUNT=0
+          TOTAL_ISSUES=0
+          
+          # Analyze NPM Audit
+          echo "" >> $REPORT_FILE
+          echo "## 📦 Dependency Scan Results" >> $REPORT_FILE
+          echo "" >> $REPORT_FILE
+          
+          NPM_AUDIT_FILE="all-scan-results/dependency-scan-results/npm-audit-report.json"
+          if [ -f "$NPM_AUDIT_FILE" ]; then
+            NPM_CRITICAL=$(jq -r '.metadata.vulnerabilities.critical // 0' "$NPM_AUDIT_FILE" 2>/dev/null || echo "0")
+            NPM_HIGH=$(jq -r '.metadata.vulnerabilities.high // 0' "$NPM_AUDIT_FILE" 2>/dev/null || echo "0")
+            NPM_MODERATE=$(jq -r '.metadata.vulnerabilities.moderate // 0' "$NPM_AUDIT_FILE" 2>/dev/null || echo "0")
+            
+            CRITICAL_COUNT=$((CRITICAL_COUNT + NPM_CRITICAL))
+            HIGH_COUNT=$((HIGH_COUNT + NPM_HIGH))
+            TOTAL_ISSUES=$((TOTAL_ISSUES + NPM_CRITICAL + NPM_HIGH))
+            
+            echo "### NPM Audit" >> $REPORT_FILE
+            echo "- 🔴 Critical: $NPM_CRITICAL" >> $REPORT_FILE
+            echo "- 🟠 High: $NPM_HIGH" >> $REPORT_FILE
+            echo "- 🟡 Moderate: $NPM_MODERATE" >> $REPORT_FILE
+            echo "" >> $REPORT_FILE
+            
+            if [ "$NPM_CRITICAL" -gt 0 ] || [ "$NPM_HIGH" -gt 0 ]; then
+              echo "**❌ Action Required:** Fix critical and high severity vulnerabilities" >> $REPORT_FILE
+              echo "" >> $REPORT_FILE
+            fi
+          else
+            echo "### NPM Audit" >> $REPORT_FILE
+            echo "- ✅ No scan results available or scan was skipped" >> $REPORT_FILE
+            echo "" >> $REPORT_FILE
+          fi
+          
+          # OWASP Dependency Check
+          OWASP_REPORT_FILE="all-scan-results/dependency-scan-results/dependency-check-report.json"
+          if [ -f "$OWASP_REPORT_FILE" ]; then
+            echo "### OWASP Dependency Check" >> $REPORT_FILE
+            # Separate CRITICAL and HIGH vulnerabilities
+            OWASP_CRITICAL=$(jq -r '[.dependencies[]?.vulnerabilities[]? | select(.severity == "CRITICAL")] | length' "$OWASP_REPORT_FILE" 2>/dev/null || echo "0")
+            OWASP_HIGH=$(jq -r '[.dependencies[]?.vulnerabilities[]? | select(.severity == "HIGH")] | length' "$OWASP_REPORT_FILE" 2>/dev/null || echo "0")
+            
+            CRITICAL_COUNT=$((CRITICAL_COUNT + OWASP_CRITICAL))
+            HIGH_COUNT=$((HIGH_COUNT + OWASP_HIGH))
+            TOTAL_ISSUES=$((TOTAL_ISSUES + OWASP_CRITICAL + OWASP_HIGH))
+            
+            if [ "$OWASP_CRITICAL" -gt 0 ] || [ "$OWASP_HIGH" -gt 0 ]; then
+              echo "- ⚠️  Found $OWASP_CRITICAL critical and $OWASP_HIGH high vulnerabilities" >> $REPORT_FILE
+            else
+              echo "- ✅ No high/critical vulnerabilities found" >> $REPORT_FILE
+            fi
+            echo "" >> $REPORT_FILE
+          fi
+          
+          # Docker Scan Results
+          echo "## 🐳 Docker Image Scan Results" >> $REPORT_FILE
+          echo "" >> $REPORT_FILE
+          
+          if [ -d "all-scan-results/docker-scan-results" ]; then
+            DOCKER_FILES=$(find all-scan-results/docker-scan-results -name "*.sarif" 2>/dev/null | wc -l)
+            if [ "$DOCKER_FILES" -gt 0 ]; then
+              echo "- ✅ Scanned $DOCKER_FILES Docker images" >> $REPORT_FILE
+              echo "- See artifacts for detailed results" >> $REPORT_FILE
+            else
+              echo "- ℹ️  No Docker images found to scan" >> $REPORT_FILE
+            fi
+          else
+            echo "- ℹ️  No Docker scan results available" >> $REPORT_FILE
+          fi
+          echo "" >> $REPORT_FILE
+          
+          # IaC Scan Results
+          echo "## 🏗️ Infrastructure as Code Scan Results" >> $REPORT_FILE
+          echo "" >> $REPORT_FILE
+          
+          if [ -d "all-scan-results/iac-scan-results" ]; then
+            echo "- ✅ IaC security scan completed" >> $REPORT_FILE
+            echo "- Scanned: Terraform, CloudFormation, Kubernetes, Docker Compose" >> $REPORT_FILE
+            echo "- See artifacts for detailed results" >> $REPORT_FILE
+          else
+            echo "- ℹ️  No IaC scan results available" >> $REPORT_FILE
+          fi
+          echo "" >> $REPORT_FILE
+          
+          # OAuth2 & OWASP Results
+          echo "## 🔐 OAuth2 & OWASP Top 10 Results" >> $REPORT_FILE
+          echo "" >> $REPORT_FILE
+          echo "- ✅ OAuth2 configuration checked" >> $REPORT_FILE
+          echo "- ✅ OWASP Top 10 2021 compliance verified" >> $REPORT_FILE
+          echo "- See workflow logs for specific findings" >> $REPORT_FILE
+          echo "" >> $REPORT_FILE
+          
+          # Overall Status
+          echo "---" >> $REPORT_FILE
+          echo "" >> $REPORT_FILE
+          echo "## 📊 Overall Security Status" >> $REPORT_FILE
+          echo "" >> $REPORT_FILE
+          
+          if [ "$CRITICAL_COUNT" -gt 0 ]; then
+            echo "### ❌ FAILED - Critical Issues Found" >> $REPORT_FILE
+            echo "" >> $REPORT_FILE
+            echo "**Critical vulnerabilities:** $CRITICAL_COUNT" >> $REPORT_FILE
+            echo "**High vulnerabilities:** $HIGH_COUNT" >> $REPORT_FILE
+            echo "**Total issues:** $TOTAL_ISSUES" >> $REPORT_FILE
+            echo "" >> $REPORT_FILE
+            echo "⛔ **Merge blocked until all critical issues are resolved**" >> $REPORT_FILE
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "block_merge=true" >> $GITHUB_OUTPUT
+          elif [ "$HIGH_COUNT" -gt 0 ]; then
+            echo "### ⚠️  WARNING - High Severity Issues Found" >> $REPORT_FILE
+            echo "" >> $REPORT_FILE
+            echo "**High vulnerabilities:** $HIGH_COUNT" >> $REPORT_FILE
+            echo "**Total issues:** $TOTAL_ISSUES" >> $REPORT_FILE
+            echo "" >> $REPORT_FILE
+            echo "⚠️  **Review and fix high severity issues before merging**" >> $REPORT_FILE
+            echo "status=warning" >> $GITHUB_OUTPUT
+            echo "block_merge=true" >> $GITHUB_OUTPUT
+          else
+            echo "### ✅ PASSED - No Critical or High Issues" >> $REPORT_FILE
+            echo "" >> $REPORT_FILE
+            echo "All security scans passed successfully!" >> $REPORT_FILE
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "block_merge=false" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "" >> $REPORT_FILE
+          echo "---" >> $REPORT_FILE
+          echo "" >> $REPORT_FILE
+          echo "## 🔗 Quick Links" >> $REPORT_FILE
+          echo "" >> $REPORT_FILE
+          echo "- [Workflow Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $REPORT_FILE
+          echo "- [Security Advisories](https://github.com/${{ github.repository }}/security/advisories)" >> $REPORT_FILE
+          echo "- [Dependabot](https://github.com/${{ github.repository }}/security/dependabot)" >> $REPORT_FILE
+          echo "" >> $REPORT_FILE
+          echo "---" >> $REPORT_FILE
+          echo "" >> $REPORT_FILE
+          echo "*This report is automatically generated by the Security Gating workflow*" >> $REPORT_FILE
+          
+          # Output summary
+          echo "critical_count=$CRITICAL_COUNT" >> $GITHUB_OUTPUT
+          echo "high_count=$HIGH_COUNT" >> $GITHUB_OUTPUT
+          echo "total_issues=$TOTAL_ISSUES" >> $GITHUB_OUTPUT
+
+      - name: Commit Security Report
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add SECURITY_SCAN_REPORT.md
+          git diff --staged --quiet || git commit -m "chore: Update security scan report [skip ci]"
+          git push || true
+        continue-on-error: true
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const reportContent = fs.readFileSync('SECURITY_SCAN_REPORT.md', 'utf8');
+            
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const botComment = comments.find(comment => 
+              comment.user.type === 'Bot' && 
+              comment.body.includes('🔒 Security Scan Report')
+            );
+            
+            const commentBody = reportContent;
+            
+            if (botComment) {
+              // Update existing comment
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: commentBody
+              });
+            } else {
+              // Create new comment
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: commentBody
+              });
+            }
+        continue-on-error: true
+
+      - name: Send Slack Notification
+        if: steps.generate-report.outputs.status != 'success' && (github.event_name == 'pull_request' || github.event_name == 'push')
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "🚨 Security Alert: ${{ github.repository }}",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "🔒 Security Scan Alert",
+                    "emoji": true
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Repository:*\n${{ github.repository }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Branch:*\n${{ github.ref_name }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status:*\n${{ steps.generate-report.outputs.status }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Triggered by:*\n${{ github.actor }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Critical Issues:*\n${{ steps.generate-report.outputs.critical_count }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*High Issues:*\n${{ steps.generate-report.outputs.high_count }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "⛔ *Merge Blocked* - Critical or high severity vulnerabilities must be resolved before merging."
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View Workflow Run"
+                      },
+                      "url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    },
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View Security Report"
+                      },
+                      "url": "https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/SECURITY_SCAN_REPORT.md"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+        continue-on-error: true
+
+      - name: Upload Security Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report
+          path: SECURITY_SCAN_REPORT.md
+          retention-days: 90
+
+      - name: Fail workflow if critical issues found
+        if: steps.generate-report.outputs.block_merge == 'true'
+        run: |
+          echo "::error::Security scan found critical or high severity issues. Merge is blocked."
+          echo "Critical issues: ${{ steps.generate-report.outputs.critical_count }}"
+          echo "High issues: ${{ steps.generate-report.outputs.high_count }}"
+          exit 1

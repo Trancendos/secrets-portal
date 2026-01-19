@@ -1,12 +1,13 @@
-name: Security Scan
+name: Security Scan (Legacy)
+
+# NOTE: This workflow has been superseded by security-gating.yml
+# It's kept for weekly scheduled scans only
+# For PR/push security checks, see .github/workflows/security-gating.yml
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   schedule:
     - cron: '0 0 * * 0'  # Weekly
+  workflow_dispatch:  # Manual trigger
 
 jobs:
   scan:
