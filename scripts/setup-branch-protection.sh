@@ -42,9 +42,11 @@ echo "3. Configure the following:"
 echo ""
 echo "   ✅ Require a pull request before merging"
 echo "   ✅ Require status checks to pass before merging"
-echo "      - Select: 'Generate Security Report'"
-echo "      - Select: 'Dependency & CVE Scan'"
-echo "      - Select: 'OAuth2 & OWASP Checks'"
+echo "      - Select: 'security-report'"
+echo "      - Select: 'dependency-scan'"
+echo "      - Select: 'docker-scan'"
+echo "      - Select: 'iac-scan'"
+echo "      - Select: 'oauth-owasp-scan'"
 echo "   ✅ Require branches to be up to date before merging"
 echo "   ✅ Do not allow bypassing the above settings"
 echo ""
@@ -61,9 +63,11 @@ gh api \
   -H "Accept: application/vnd.github+json" \
   "/repos/$REPO/branches/$BRANCH/protection" \
   -f required_status_checks[strict]=true \
-  -f required_status_checks[contexts][]="Generate Security Report" \
-  -f required_status_checks[contexts][]="Dependency & CVE Scan" \
-  -f required_status_checks[contexts][]="OAuth2 & OWASP Checks" \
+  -f required_status_checks[contexts][]="security-report" \
+  -f required_status_checks[contexts][]="dependency-scan" \
+  -f required_status_checks[contexts][]="docker-scan" \
+  -f required_status_checks[contexts][]="iac-scan" \
+  -f required_status_checks[contexts][]="oauth-owasp-scan" \
   -f enforce_admins=true \
   -f required_pull_request_reviews[required_approving_review_count]=1 \
   -f required_pull_request_reviews[dismiss_stale_reviews]=true \

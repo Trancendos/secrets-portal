@@ -135,9 +135,12 @@ jobs:
         run: |
           mkdir -p scan-results
           for dockerfile in $(find . -name "Dockerfile*" -o -name "*.dockerfile"); do
-            IMAGE_NAME="scan-$(basename $(dirname $dockerfile))-$(basename $dockerfile)"
+            # Sanitize the image name to avoid shell injection
+            SAFE_DIR=$(basename "$(dirname "$dockerfile")" | tr -cd '[:alnum:]._-')
+            SAFE_FILE=$(basename "$dockerfile" | tr -cd '[:alnum:]._-')
+            IMAGE_NAME="scan-${SAFE_DIR}-${SAFE_FILE}"
             echo "Building $IMAGE_NAME from $dockerfile"
-            docker build -f "$dockerfile" -t "$IMAGE_NAME:latest" $(dirname "$dockerfile") || true
+            docker build -f "$dockerfile" -t "$IMAGE_NAME:latest" "$(dirname "$dockerfile")" || true
           done
         continue-on-error: true
 
@@ -145,14 +148,17 @@ jobs:
         if: steps.check-docker.outputs.has_docker == 'true'
         run: |
           mkdir -p scan-results
+          IMAGE_COUNT=0
           for image in $(docker images --format "{{.Repository}}:{{.Tag}}" | grep "^scan-"); do
+            IMAGE_COUNT=$((IMAGE_COUNT + 1))
+            # Use image count for unique filenames to avoid collisions
             echo "Scanning image: $image"
             docker run --rm \
               -v /var/run/docker.sock:/var/run/docker.sock \
               -v $(pwd)/scan-results:/results \
               aquasec/trivy:latest image \
               --format sarif \
-              --output /results/trivy-docker-$(echo $image | tr ':/' '--').sarif \
+              --output /results/trivy-docker-${IMAGE_COUNT}.sarif \
               --severity HIGH,CRITICAL \
               --exit-code 0 \
               "$image" || true
@@ -265,8 +271,8 @@ jobs:
           # Check for OAuth2 best practices
           echo "Checking OAuth2 implementation..."
           
-          # Check for client secret in code (should not exist)
-          if grep -r "client_secret" src/ 2>/dev/null | grep -v "\.test\." | grep -v "example"; then
+          # Check for client secret in code (should not exist) - exclude test files and examples
+          if grep -r "client_secret" src/ 2>/dev/null | grep -v -E "\\.test\\.|_test\\.|\\btests?/|\\bspec\\.|example"; then
             ISSUES="${ISSUES}\n- ❌ Client secret found in source code"
           fi
           
@@ -382,21 +388,23 @@ jobs:
         run: |
           REPORT_FILE="SECURITY_SCAN_REPORT.md"
           TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          WORKFLOW="${{ github.workflow }}"
+          RUN_NUMBER="${{ github.run_number }}"
+          COMMIT_SHA="${{ github.sha }}"
+          REF_NAME="${{ github.ref_name }}"
           
-          cat > $REPORT_FILE << 'EOFHEADER'
+          cat > $REPORT_FILE << EOFHEADER
           # 🔒 Security Scan Report
           
-          **Generated:** TIMESTAMP_PLACEHOLDER
-          **Workflow:** ${{ github.workflow }}
-          **Run:** ${{ github.run_number }}
-          **Commit:** ${{ github.sha }}
-          **Branch:** ${{ github.ref_name }}
+          **Generated:** $TIMESTAMP
+          **Workflow:** $WORKFLOW
+          **Run:** $RUN_NUMBER
+          **Commit:** $COMMIT_SHA
+          **Branch:** $REF_NAME
           
           ---
           
           EOFHEADER
-          
-          sed -i "s/TIMESTAMP_PLACEHOLDER/$TIMESTAMP/" $REPORT_FILE
           
           CRITICAL_COUNT=0
           HIGH_COUNT=0
@@ -407,10 +415,11 @@ jobs:
           echo "## 📦 Dependency Scan Results" >> $REPORT_FILE
           echo "" >> $REPORT_FILE
           
-          if [ -f "all-scan-results/dependency-scan-results/npm-audit-report.json" ]; then
-            NPM_CRITICAL=$(jq -r '.metadata.vulnerabilities.critical // 0' all-scan-results/dependency-scan-results/npm-audit-report.json 2>/dev/null || echo "0")
-            NPM_HIGH=$(jq -r '.metadata.vulnerabilities.high // 0' all-scan-results/dependency-scan-results/npm-audit-report.json 2>/dev/null || echo "0")
-            NPM_MODERATE=$(jq -r '.metadata.vulnerabilities.moderate // 0' all-scan-results/dependency-scan-results/npm-audit-report.json 2>/dev/null || echo "0")
+          NPM_AUDIT_FILE="all-scan-results/dependency-scan-results/npm-audit-report.json"
+          if [ -f "$NPM_AUDIT_FILE" ]; then
+            NPM_CRITICAL=$(jq -r '.metadata.vulnerabilities.critical // 0' "$NPM_AUDIT_FILE" 2>/dev/null || echo "0")
+            NPM_HIGH=$(jq -r '.metadata.vulnerabilities.high // 0' "$NPM_AUDIT_FILE" 2>/dev/null || echo "0")
+            NPM_MODERATE=$(jq -r '.metadata.vulnerabilities.moderate // 0' "$NPM_AUDIT_FILE" 2>/dev/null || echo "0")
             
             CRITICAL_COUNT=$((CRITICAL_COUNT + NPM_CRITICAL))
             HIGH_COUNT=$((HIGH_COUNT + NPM_HIGH))
@@ -433,12 +442,19 @@ jobs:
           fi
           
           # OWASP Dependency Check
-          if [ -f "all-scan-results/dependency-scan-results/dependency-check-report.json" ]; then
+          OWASP_REPORT_FILE="all-scan-results/dependency-scan-results/dependency-check-report.json"
+          if [ -f "$OWASP_REPORT_FILE" ]; then
             echo "### OWASP Dependency Check" >> $REPORT_FILE
-            OWASP_VULNS=$(jq -r '.dependencies[].vulnerabilities[]? | select(.severity == "CRITICAL" or .severity == "HIGH") | .severity' all-scan-results/dependency-scan-results/dependency-check-report.json 2>/dev/null | wc -l || echo "0")
-            if [ "$OWASP_VULNS" -gt 0 ]; then
-              echo "- ⚠️  Found $OWASP_VULNS high/critical vulnerabilities" >> $REPORT_FILE
-              TOTAL_ISSUES=$((TOTAL_ISSUES + OWASP_VULNS))
+            # Separate CRITICAL and HIGH vulnerabilities
+            OWASP_CRITICAL=$(jq -r '[.dependencies[]?.vulnerabilities[]? | select(.severity == "CRITICAL")] | length' "$OWASP_REPORT_FILE" 2>/dev/null || echo "0")
+            OWASP_HIGH=$(jq -r '[.dependencies[]?.vulnerabilities[]? | select(.severity == "HIGH")] | length' "$OWASP_REPORT_FILE" 2>/dev/null || echo "0")
+            
+            CRITICAL_COUNT=$((CRITICAL_COUNT + OWASP_CRITICAL))
+            HIGH_COUNT=$((HIGH_COUNT + OWASP_HIGH))
+            TOTAL_ISSUES=$((TOTAL_ISSUES + OWASP_CRITICAL + OWASP_HIGH))
+            
+            if [ "$OWASP_CRITICAL" -gt 0 ] || [ "$OWASP_HIGH" -gt 0 ]; then
+              echo "- ⚠️  Found $OWASP_CRITICAL critical and $OWASP_HIGH high vulnerabilities" >> $REPORT_FILE
             else
               echo "- ✅ No high/critical vulnerabilities found" >> $REPORT_FILE
             fi
