@@ -1,5 +1,8 @@
 # Secrets Portal
 
+[![Security Gating](https://github.com/Trancendos/secrets-portal/workflows/Security%20Gating/badge.svg)](https://github.com/Trancendos/secrets-portal/actions/workflows/security-gating.yml)
+[![Deploy to GitHub Pages](https://github.com/Trancendos/secrets-portal/workflows/Deploy%20to%20GitHub%20Pages/badge.svg)](https://github.com/Trancendos/secrets-portal/actions/workflows/deploy.yml)
+
 Zero-cost GitHub Secrets Management Portal
 
 ## Features
@@ -77,6 +80,15 @@ GitHub Secrets Vault (Encrypted)
 - ✅ HTTPS only
 - ✅ Auto-masking in logs
 - ✅ Audit trail for all operations
+- 🔒 **CI/CD Security Gating** - Automated vulnerability scanning
+  - Dependency & CVE scanning (NPM, OWASP, Trivy)
+  - Docker image security scanning
+  - Infrastructure as Code validation
+  - OAuth2 & OWASP Top 10 compliance checks
+  - Automatic merge blocking on critical issues
+  - Slack alerts for security findings
+
+See [SECURITY_GATING.md](SECURITY_GATING.md) for detailed security scanning documentation.
 
 ## Project Structure
 
